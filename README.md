@@ -55,6 +55,7 @@ cargo test --workspace --all-targets
 ## ライセンス
 
 MIT License。原本の著作権表示を `LICENSE` に残しています。
+利用している OSS とそのライセンスは `LICENSES.md` にまとめています。
 
 ## 謝辞
 
