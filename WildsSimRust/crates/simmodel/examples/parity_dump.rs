@@ -324,6 +324,11 @@ fn apply_first_cludes(sim: &mut Simulator, scenario: &Value) -> bool {
     added
 }
 
+fn new_searcher(sim: &Simulator, condition: SearchCondition) -> simmodel::SimResult<Searcher> {
+    let range = build_search_range(&condition, &sim.masters);
+    Searcher::new(condition, range)
+}
+
 fn run_scenario(sim: &mut Simulator, scenario: &Value, out: &mut String) {
     let id = str_field(scenario, "id").unwrap_or_default();
     let limit = int_field(scenario, "limit").unwrap_or(10);
@@ -331,7 +336,13 @@ fn run_scenario(sim: &mut Simulator, scenario: &Value, out: &mut String) {
     let added_cludes = apply_first_cludes(sim, scenario);
     if bool_field(scenario, "extra", false) {
         let cancel = AtomicBool::new(false);
-        let skills = match sim.search_extra_skill(&condition, &cancel, None) {
+        let skills = match simmodel::simulator::search_extra_skill_impl(
+            &sim.masters,
+            &sim.logic,
+            &condition,
+            &cancel,
+            None,
+        ) {
             Ok(skills) => skills,
             Err(error) => {
                 write_error(out, &id, &error.to_string());
@@ -347,14 +358,35 @@ fn run_scenario(sim: &mut Simulator, scenario: &Value, out: &mut String) {
         cleanup_cludes(sim, added_cludes);
         return;
     }
-    if bool_field(scenario, "charm_search", false) {
-        if let Err(error) = sim.search(condition, limit, None) {
+    let skills = condition.skills.clone();
+    let mut searcher = match new_searcher(sim, condition) {
+        Ok(searcher) => searcher,
+        Err(error) => {
             write_error(out, &id, &error.to_string());
             cleanup_cludes(sim, added_cludes);
             return;
         }
+    };
+    let mut all = match searcher.exec_search(limit, None) {
+        Ok(all) => all,
+        Err(error) => {
+            write_error(out, &id, &error.to_string());
+            cleanup_cludes(sim, added_cludes);
+            return;
+        }
+    };
+    let _ = sim.update_recent_skill(&skills);
+    if bool_field(scenario, "charm_search", false) {
+        sim.adopt_searcher(searcher);
         let cancel = AtomicBool::new(false);
-        let sets = match sim.search_charm(&cancel, None) {
+        let condition = sim.current_condition().unwrap();
+        let sets = match simmodel::simulator::search_charm_impl(
+            &sim.masters,
+            &sim.logic,
+            &condition,
+            &cancel,
+            None,
+        ) {
             Ok(sets) => sets,
             Err(error) => {
                 write_error(out, &id, &error.to_string());
@@ -366,26 +398,17 @@ fn run_scenario(sim: &mut Simulator, scenario: &Value, out: &mut String) {
         cleanup_cludes(sim, added_cludes);
         return;
     }
-    let sets = match sim.search(condition, limit, None) {
-        Ok(sets) => sets,
-        Err(error) => {
-            write_error(out, &id, &error.to_string());
-            cleanup_cludes(sim, added_cludes);
-            return;
-        }
-    };
-    let sets = match int_field(scenario, "more") {
-        Some(more) => match sim.search_more(more, None) {
-            Ok(sets) => sets,
+    if let Some(more) = int_field(scenario, "more") {
+        match searcher.exec_search(more, None) {
+            Ok(done) => all = done,
             Err(error) => {
                 write_error(out, &id, &error.to_string());
                 cleanup_cludes(sim, added_cludes);
                 return;
             }
-        },
-        None => sets,
-    };
-    let all = sim.is_searched_all;
+        }
+    }
+    let sets = sim.adopt_searcher(searcher);
     write_results(&id, &sets, all, out);
     cleanup_cludes(sim, added_cludes);
 }

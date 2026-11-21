@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::error::SimResult;
 use crate::model::*;
 use crate::searcher::Searcher;
@@ -50,35 +52,73 @@ pub fn make_generic_decos() -> Vec<Equipment> {
     decos
 }
 
+// True when `left` can substitute for `right`: a set needs right's skills and
+// slot types, and left (with decos when allowed) satisfies the whole thing.
 pub fn is_left_upper(
-    masters: &Masters,
+    decos: &[Equipment],
     left: &Equipment,
     right: &Equipment,
     use_decos: bool,
 ) -> SimResult<bool> {
-    let mut searcher = make_charm_searcher(masters, right, std::slice::from_ref(left), use_decos)?;
+    let mut searcher = make_charm_searcher(decos, right, std::slice::from_ref(left), use_decos)?;
     searcher.exec_search(1, None)?;
     Ok(!searcher.result_sets.is_empty())
 }
 
-pub fn has_upper_charm(
-    masters: &Masters,
+pub fn find_upper_charm(
+    decos: &[Equipment],
     charm: &Equipment,
+    candidates: &[Equipment],
+    excluded: &HashSet<String>,
     use_decos: bool,
 ) -> SimResult<Option<Equipment>> {
-    let charm_range: Vec<Equipment> = masters
-        .additional_charms
+    let charm_range: Vec<Equipment> = candidates
         .iter()
-        .filter(|candidate| candidate.name != charm.name)
+        .filter(|candidate| candidate.name != charm.name && !excluded.contains(&candidate.name))
         .cloned()
         .collect();
-    let mut searcher = make_charm_searcher(masters, charm, &charm_range, use_decos)?;
+    let mut searcher = make_charm_searcher(decos, charm, &charm_range, use_decos)?;
     searcher.exec_search(1, None)?;
     Ok(searcher.result_sets.first().map(|set| set.charm.clone()))
 }
 
+// Finds the strongest replacement for `charm` among `candidates`. An equivalent
+// charm (each side can substitute the other) is only reported when no strictly
+// better one exists, and is skipped while looking for a better one, because the
+// scorer rates equivalent and strictly-better charms the same.
+pub fn upper_info_for(
+    decos: &[Equipment],
+    charm: &Equipment,
+    candidates: &[Equipment],
+    use_decos: bool,
+) -> SimResult<Option<UpperInfo>> {
+    let mut excluded = HashSet::new();
+    let mut equivalent: Option<Equipment> = None;
+    while let Some(upper) = find_upper_charm(decos, charm, candidates, &excluded, use_decos)? {
+        if is_left_upper(decos, charm, &upper, use_decos)? {
+            if equivalent.is_none() {
+                equivalent = Some(upper.clone());
+            }
+            if !excluded.insert(upper.name.clone()) {
+                break;
+            }
+            continue;
+        }
+        return Ok(Some(UpperInfo {
+            name: upper.name.clone(),
+            disp_name: upper.disp_name().to_string(),
+            is_full_upper: true,
+        }));
+    }
+    Ok(equivalent.map(|upper| UpperInfo {
+        name: upper.name.clone(),
+        disp_name: upper.disp_name().to_string(),
+        is_full_upper: false,
+    }))
+}
+
 fn make_charm_searcher(
-    masters: &Masters,
+    decos: &[Equipment],
     base_charm: &Equipment,
     charm_range: &[Equipment],
     use_decos: bool,
@@ -108,11 +148,13 @@ fn make_charm_searcher(
             }
         }
     }
-    let mut range = SearchRange::new_empty();
-    range.charms = charm_range.to_vec();
+    let mut range = SearchRange {
+        charms: charm_range.to_vec(),
+        ..SearchRange::default()
+    };
     if use_decos {
         range.decos.extend(generic_decos);
-        range.decos.extend(masters.decos.iter().cloned());
+        range.decos.extend(decos.iter().cloned());
     } else {
         range.decos = generic_decos;
     }

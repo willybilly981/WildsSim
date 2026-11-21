@@ -50,14 +50,8 @@ impl FileOperation {
 
     pub fn read_all_text(&self, relative: &str, required: bool) -> SimResult<String> {
         let path = self.path(relative);
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-                    &bytes[3..]
-                } else {
-                    &bytes[..]
-                };
-                let mut text = String::from_utf8_lossy(bytes).into_owned();
+        match read_text(&path) {
+            Ok(mut text) => {
                 if let Some(stripped) = text.strip_prefix('#') {
                     text = stripped.to_string();
                 }
@@ -82,7 +76,12 @@ impl FileOperation {
 
     fn load_table(&self, relative: &str, required: bool) -> SimResult<CsvTable> {
         let text = self.read_all_text(relative, required)?;
-        Ok(CsvTable::parse(&text))
+        CsvTable::parse(&text).map_err(|error| {
+            SimError(format!(
+                "ファイル {} の読み込みに失敗しました。: {}",
+                relative, error
+            ))
+        })
     }
 
     pub fn load_skill_csv(&self) -> SimResult<Vec<Skill>> {
@@ -320,63 +319,25 @@ impl FileOperation {
         let mut sets = Vec::new();
         for row in table.rows.iter() {
             let mut set = EquipSet::new();
-            let weapon_name = get(&table, row, "武器", MY_SET_CSV)?;
-            set.weapon = match get_equip_by_name(weapon_name, equips) {
-                Some(equip) if equip.kind == EquipKind::Weapon => equip.clone(),
-                _ => {
-                    let mut weapon = Equipment::new_weapon();
-                    weapon.name = weapon_name.to_string();
-                    weapon
-                }
-            };
-            set.head = get_equip_by_name(get(&table, row, "頭", MY_SET_CSV)?, equips)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let mut equip = Equipment::default();
-                    equip.name = get_opt(&table, row, "頭").unwrap_or("").to_string();
-                    equip
-                });
-            set.body = get_equip_by_name(get(&table, row, "胴", MY_SET_CSV)?, equips)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let mut equip = Equipment::default();
-                    equip.name = get_opt(&table, row, "胴").unwrap_or("").to_string();
-                    equip
-                });
-            set.arm = get_equip_by_name(get(&table, row, "腕", MY_SET_CSV)?, equips)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let mut equip = Equipment::default();
-                    equip.name = get_opt(&table, row, "腕").unwrap_or("").to_string();
-                    equip
-                });
-            set.waist = get_equip_by_name(get(&table, row, "腰", MY_SET_CSV)?, equips)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let mut equip = Equipment::default();
-                    equip.name = get_opt(&table, row, "腰").unwrap_or("").to_string();
-                    equip
-                });
-            set.leg = get_equip_by_name(get(&table, row, "足", MY_SET_CSV)?, equips)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let mut equip = Equipment::default();
-                    equip.name = get_opt(&table, row, "足").unwrap_or("").to_string();
-                    equip
-                });
-            set.charm = get_equip_by_name(get(&table, row, "護石", MY_SET_CSV)?, equips)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let mut equip = Equipment::default();
-                    equip.name = get_opt(&table, row, "護石").unwrap_or("").to_string();
-                    equip
-                });
-            set.head.kind = EquipKind::Head;
-            set.body.kind = EquipKind::Body;
-            set.arm.kind = EquipKind::Arm;
-            set.waist.kind = EquipKind::Waist;
-            set.leg.kind = EquipKind::Leg;
-            set.charm.kind = EquipKind::Charm;
+            set.weapon = equip_or_named(
+                get(&table, row, "武器", MY_SET_CSV)?,
+                EquipKind::Weapon,
+                equips,
+            );
+            set.head = equip_or_named(get(&table, row, "頭", MY_SET_CSV)?, EquipKind::Head, equips);
+            set.body = equip_or_named(get(&table, row, "胴", MY_SET_CSV)?, EquipKind::Body, equips);
+            set.arm = equip_or_named(get(&table, row, "腕", MY_SET_CSV)?, EquipKind::Arm, equips);
+            set.waist = equip_or_named(
+                get(&table, row, "腰", MY_SET_CSV)?,
+                EquipKind::Waist,
+                equips,
+            );
+            set.leg = equip_or_named(get(&table, row, "足", MY_SET_CSV)?, EquipKind::Leg, equips);
+            set.charm = equip_or_named(
+                get(&table, row, "護石", MY_SET_CSV)?,
+                EquipKind::Charm,
+                equips,
+            );
             set.decos = decos_from_csv(get(&table, row, "装飾品", MY_SET_CSV)?, equips);
             set.sort_decos();
             set.name = get(&table, row, "名前", MY_SET_CSV)?.to_string();
@@ -873,18 +834,32 @@ impl FileOperation {
 // A save file cut off mid-row makes load fail and the app refuse to start, so a crash
 // during a save must leave either the old or the new file, never a partial one.
 // std::fs::rename replaces the target on Windows (MoveFileExW with REPLACE_EXISTING).
+// The temp name is unique so two processes writing to the same folder do not race
+// on the same .tmp path, and any failure cleans it up.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut temp = path.as_os_str().to_owned();
-    temp.push(".tmp");
+    temp.push(format!(".{}.tmp", Uuid::new_v4()));
     let temp = PathBuf::from(temp);
-    {
-        let mut file = std::fs::File::create(&temp)?;
-        std::io::Write::write_all(&mut file, bytes)?;
-        file.sync_all()?;
+    let result = std::fs::File::create(&temp).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, bytes).and_then(|_| file.sync_all())
+    });
+    match result.and_then(|_| std::fs::rename(&temp, path)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
     }
-    std::fs::rename(&temp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&temp);
-    })
+}
+
+pub fn read_text(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    let bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &bytes[3..]
+    } else {
+        &bytes[..]
+    };
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
 fn get<'a>(table: &CsvTable, row: &'a CsvRow, name: &str, file: &str) -> SimResult<&'a str> {
@@ -973,17 +948,7 @@ fn load_skills(
     lookup: &SkillLookup,
     file: &str,
 ) -> SimResult<Vec<Skill>> {
-    let count = skill_count(table);
-    let mut skills = Vec::new();
-    for i in 1..=count {
-        let name = get(table, row, &format!("スキル系統{}", i), file)?;
-        if name.trim().is_empty() {
-            break;
-        }
-        let level = parse_i32_default(get(table, row, &format!("スキル値{}", i), file)?);
-        skills.push(lookup.make(name, level));
-    }
-    Ok(skills)
+    load_skills_limited(table, row, lookup, skill_count(table) as i32, file)
 }
 
 fn load_skills_limited(
@@ -1005,9 +970,24 @@ fn load_skills_limited(
     Ok(skills)
 }
 
-fn get_equip_by_name<'a>(name: &str, equips: &'a [Equipment]) -> Option<&'a Equipment> {
+fn find_equip<'a>(name: &str, kind: EquipKind, equips: &'a [Equipment]) -> Option<&'a Equipment> {
     let name = name.trim();
-    equips.iter().find(|equip| equip.name == name)
+    equips
+        .iter()
+        .find(|equip| equip.name == name && equip.kind == kind)
+}
+
+// Missing equipment keeps its name (like the C# original) so a later save does
+// not silently drop parts whose master entry disappeared.
+fn equip_or_named(name: &str, kind: EquipKind, equips: &[Equipment]) -> Equipment {
+    match find_equip(name, kind, equips) {
+        Some(equip) => equip.clone(),
+        None => {
+            let mut equip = Equipment::new(kind);
+            equip.name = name.to_string();
+            equip
+        }
+    }
 }
 
 fn decos_from_csv(csv: &str, equips: &[Equipment]) -> Vec<Equipment> {
@@ -1016,23 +996,9 @@ fn decos_from_csv(csv: &str, equips: &[Equipment]) -> Vec<Equipment> {
         if name.trim().is_empty() {
             continue;
         }
-        if let Some(deco) = get_equip_by_name(name, equips) {
-            decos.push(deco.clone());
-        }
+        // A deco missing from the masters survives by name; sort_decos keeps
+        // slot-0 entries so a later save does not silently drop it.
+        decos.push(equip_or_named(name, EquipKind::Deco, equips));
     }
     decos
-}
-
-pub fn data_root_from_env() -> PathBuf {
-    if let Ok(root) = std::env::var("WILDSSIM_DATA_DIR") {
-        return PathBuf::from(root);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if dir.join(SKILL_CSV).exists() {
-                return dir.to_path_buf();
-            }
-        }
-    }
-    Path::new(".").to_path_buf()
 }

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::error::{SimError, SimResult};
+use crate::file_operation::read_text;
 use crate::parse_util::{parse_bool, parse_i32};
 
 #[derive(Clone, Debug)]
@@ -43,7 +44,7 @@ impl LogicConfig {
                 )))
             }
         };
-        let table = crate::csv_util::CsvTable::parse(&text);
+        let table = crate::csv_util::CsvTable::parse(&text)?;
         if let Some(row) = table.rows.first() {
             config.max_slot_size =
                 get_i32(&table, row, "スロットの最大の大きさ", config.max_slot_size);
@@ -90,6 +91,13 @@ impl LogicConfig {
                 &config.default_my_set_name,
             );
         }
+        if !(0..=4).contains(&config.max_slot_size) {
+            return Err(SimError(format!(
+                "設定ファイル {} のスロットの最大の大きさ {} が不正です。0 から 4 の範囲で指定してください。",
+                conf_csv.display(),
+                config.max_slot_size
+            )));
+        }
         Ok(config)
     }
 }
@@ -98,7 +106,6 @@ impl LogicConfig {
 pub struct ViewConfig {
     pub default_limit: String,
     pub no_skill_name: String,
-    pub use_saved_column_indexes: bool,
 }
 
 impl Default for ViewConfig {
@@ -106,7 +113,6 @@ impl Default for ViewConfig {
         ViewConfig {
             default_limit: "100".to_string(),
             no_skill_name: "スキル選択".to_string(),
-            use_saved_column_indexes: false,
         }
     }
 }
@@ -124,27 +130,15 @@ impl ViewConfig {
                 )))
             }
         };
-        let table = crate::csv_util::CsvTable::parse(&text);
+        let table = crate::csv_util::CsvTable::parse(&text)?;
         if let Some(row) = table.rows.first() {
             config.default_limit =
                 get_string(&table, row, "デフォルトの頑張り度", &config.default_limit);
             config.no_skill_name =
                 get_string(&table, row, "スキル未選択時の表示", &config.no_skill_name);
-            config.use_saved_column_indexes =
-                get_string(&table, row, "グリッドの列順保存有無", "有") == "有";
         }
         Ok(config)
     }
-}
-
-fn read_text(path: &Path) -> std::io::Result<String> {
-    let bytes = std::fs::read(path)?;
-    let bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        &bytes[3..]
-    } else {
-        &bytes[..]
-    };
-    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
 fn get_string(

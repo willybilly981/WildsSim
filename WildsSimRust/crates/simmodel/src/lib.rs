@@ -8,9 +8,11 @@ pub mod parse_util;
 pub mod searcher;
 pub mod simulator;
 
+pub use uuid::Uuid;
+
 pub use config::{LogicConfig, ViewConfig};
 pub use error::{SimError, SimResult};
-pub use file_operation::{data_root_from_env, FileOperation};
+pub use file_operation::FileOperation;
 pub use model::*;
 pub use searcher::Searcher;
 pub use simulator::Simulator;

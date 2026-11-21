@@ -15,54 +15,38 @@ impl CsvRow {
 
 #[derive(Clone, Debug, Default)]
 pub struct CsvTable {
-    headers: Vec<String>,
     header_index: HashMap<String, usize>,
     pub rows: Vec<CsvRow>,
 }
 
 impl CsvTable {
-    pub fn parse(text: &str) -> CsvTable {
+    // Parse errors are propagated: silently skipping a broken row (e.g. an
+    // unclosed quote) would make the next save truncate the file.
+    pub fn parse(text: &str) -> SimResult<CsvTable> {
         if text.is_empty() {
-            return CsvTable::default();
+            return Ok(CsvTable::default());
         }
-        let text = if let Some(stripped) = text.strip_prefix('#') {
-            stripped.to_string()
-        } else {
-            text.to_string()
-        };
-        let text = text
-            .replace("生産素材1,個数", "生産素材1,生産素材個数1")
-            .replace("生産素材2,個数", "生産素材2,生産素材個数2")
-            .replace("生産素材3,個数", "生産素材3,生産素材個数3")
-            .replace("生産素材4,個数", "生産素材4,生産素材個数4")
-            .replace("生産素材A1,個数", "生産素材1,生産素材個数1")
-            .replace("生産素材A2,個数", "生産素材2,生産素材個数2")
-            .replace("生産素材A3,個数", "生産素材3,生産素材個数3")
-            .replace("生産素材A4,個数", "生産素材4,生産素材個数4");
+        let text = text.strip_prefix('#').unwrap_or(text);
         let mut reader = csv::ReaderBuilder::new()
             .has_headers(true)
             .flexible(true)
             .comment(Some(b'#'))
             .from_reader(text.as_bytes());
-        let headers = match reader.headers() {
-            Ok(headers) => headers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            Err(_) => Vec::new(),
-        };
         let mut header_index = HashMap::new();
-        for (i, header) in headers.iter().enumerate() {
-            header_index.insert(header.clone(), i);
+        {
+            let headers = reader.headers()?;
+            for (i, header) in headers.iter().enumerate() {
+                header_index.insert(header.to_string(), i);
+            }
         }
         let mut rows = Vec::new();
-        for record in reader.records().flatten() {
+        for record in reader.records() {
+            let record = record?;
             rows.push(CsvRow {
                 values: record.iter().map(|s| s.to_string()).collect(),
             });
         }
-        CsvTable {
-            headers,
-            header_index,
-            rows,
-        }
+        Ok(CsvTable { header_index, rows })
     }
 
     pub fn has_column(&self, name: &str) -> bool {
@@ -82,16 +66,6 @@ impl CsvTable {
     pub fn get_opt<'a>(&self, row: &'a CsvRow, name: &str) -> Option<&'a str> {
         let index = self.header_index.get(name).copied()?;
         row.get(index)
-    }
-
-    pub fn contains_value_prefix(&self, row: &CsvRow, name: &str, prefix: &str) -> bool {
-        self.get_opt(row, name)
-            .map(|v| v.starts_with(prefix))
-            .unwrap_or(false)
-    }
-
-    pub fn headers(&self) -> &[String] {
-        &self.headers
     }
 }
 

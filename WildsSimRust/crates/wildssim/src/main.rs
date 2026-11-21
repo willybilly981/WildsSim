@@ -15,7 +15,10 @@ fn show_error(message: String) -> ! {
 }
 
 fn main() {
-    let data_root = data::resolve_data_root();
+    let data_root = match data::resolve_data_root() {
+        Ok(root) => root,
+        Err(error) => show_error(error),
+    };
     let simulator = match simmodel::Simulator::load(&data_root) {
         Ok(simulator) => simulator,
         Err(error) => show_error(format!(

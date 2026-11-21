@@ -34,6 +34,17 @@ impl Searcher {
         all_equips.extend(range.charms.iter().cloned());
         all_equips.extend(range.decos.iter().cloned());
 
+        for equip in &all_equips {
+            for size in [equip.slot1, equip.slot2, equip.slot3] {
+                if !(0..=4).contains(&size) {
+                    return Err(SimError(format!(
+                        "装備 {} のスロットサイズ {} が不正です。0 から 4 の範囲で指定してください。",
+                        equip.name, size
+                    )));
+                }
+            }
+        }
+
         let mut seen_skills = HashSet::new();
         for skill in &condition.skills {
             if !seen_skills.insert(skill.name.clone()) {
@@ -139,8 +150,10 @@ impl Searcher {
         Ok(all_searched)
     }
 
-    pub fn is_all_searched(&self) -> bool {
-        self.all_searched
+    // True when a solve or constraint failure destroyed the state needed to
+    // continue: exec_search would then report "all searched" without searching.
+    pub fn is_dead(&self) -> bool {
+        self.solution.is_none() && self.problem.is_none() && !self.all_searched
     }
 
     fn build(&mut self) -> SimResult<()> {
@@ -166,61 +179,27 @@ impl Searcher {
             self.variables.insert(equip.name.clone(), var);
         }
 
-        let mut weapon = LinearExpr::empty();
-        let mut weapon_terms = false;
-        let mut head = LinearExpr::empty();
-        let mut head_terms = false;
-        let mut body = LinearExpr::empty();
-        let mut body_terms = false;
-        let mut arm = LinearExpr::empty();
-        let mut arm_terms = false;
-        let mut waist = LinearExpr::empty();
-        let mut waist_terms = false;
-        let mut leg = LinearExpr::empty();
-        let mut leg_terms = false;
-        let mut charm = LinearExpr::empty();
-        let mut charm_terms = false;
-        let mut weapon_slots = [
-            LinearExpr::empty(),
-            LinearExpr::empty(),
-            LinearExpr::empty(),
-            LinearExpr::empty(),
-        ];
-        let mut weapon_slot_terms = [false; 4];
-        let mut armor_slots = [
-            LinearExpr::empty(),
-            LinearExpr::empty(),
-            LinearExpr::empty(),
-            LinearExpr::empty(),
-        ];
-        let mut armor_slot_terms = [false; 4];
-        let mut all_slots = [
-            LinearExpr::empty(),
-            LinearExpr::empty(),
-            LinearExpr::empty(),
-            LinearExpr::empty(),
-        ];
-        let mut all_slot_terms = [false; 4];
-        let mut def = LinearExpr::empty();
-        let mut def_terms = false;
-        let mut fire = LinearExpr::empty();
-        let mut fire_terms = false;
-        let mut water = LinearExpr::empty();
-        let mut water_terms = false;
-        let mut thunder = LinearExpr::empty();
-        let mut thunder_terms = false;
-        let mut ice = LinearExpr::empty();
-        let mut ice_terms = false;
-        let mut dragon = LinearExpr::empty();
-        let mut dragon_terms = false;
-        let mut attack = LinearExpr::empty();
-        let mut attack_terms = false;
+        let mut weapon = Terms::new();
+        let mut head = Terms::new();
+        let mut body = Terms::new();
+        let mut arm = Terms::new();
+        let mut waist = Terms::new();
+        let mut leg = Terms::new();
+        let mut charm = Terms::new();
+        let mut weapon_slots = [Terms::new(), Terms::new(), Terms::new(), Terms::new()];
+        let mut armor_slots = [Terms::new(), Terms::new(), Terms::new(), Terms::new()];
+        let mut all_slots = [Terms::new(), Terms::new(), Terms::new(), Terms::new()];
+        let mut def = Terms::new();
+        let mut fire = Terms::new();
+        let mut water = Terms::new();
+        let mut thunder = Terms::new();
+        let mut ice = Terms::new();
+        let mut dragon = Terms::new();
+        let mut attack = Terms::new();
 
-        let mut skill_exprs: HashMap<String, LinearExpr> = HashMap::new();
-        let mut skill_terms: HashMap<String, bool> = HashMap::new();
+        let mut skills: HashMap<String, Terms> = HashMap::new();
         for skill in &self.condition.skills {
-            skill_exprs.insert(skill.name.clone(), LinearExpr::empty());
-            skill_terms.insert(skill.name.clone(), false);
+            skills.insert(skill.name.clone(), Terms::new());
         }
         let mut one_set_exprs: HashMap<i32, LinearExpr> = HashMap::new();
 
@@ -228,34 +207,13 @@ impl Searcher {
             let var = *self.variables.get(&equip.name).unwrap();
             let is_deco = equip.kind == EquipKind::Deco;
             match equip.kind {
-                EquipKind::Weapon => {
-                    weapon.add(var, 1.0);
-                    weapon_terms = true;
-                }
-                EquipKind::Head => {
-                    head.add(var, 1.0);
-                    head_terms = true;
-                }
-                EquipKind::Body => {
-                    body.add(var, 1.0);
-                    body_terms = true;
-                }
-                EquipKind::Arm => {
-                    arm.add(var, 1.0);
-                    arm_terms = true;
-                }
-                EquipKind::Waist => {
-                    waist.add(var, 1.0);
-                    waist_terms = true;
-                }
-                EquipKind::Leg => {
-                    leg.add(var, 1.0);
-                    leg_terms = true;
-                }
-                EquipKind::Charm => {
-                    charm.add(var, 1.0);
-                    charm_terms = true;
-                }
+                EquipKind::Weapon => weapon.add(var, 1.0),
+                EquipKind::Head => head.add(var, 1.0),
+                EquipKind::Body => body.add(var, 1.0),
+                EquipKind::Arm => arm.add(var, 1.0),
+                EquipKind::Waist => waist.add(var, 1.0),
+                EquipKind::Leg => leg.add(var, 1.0),
+                EquipKind::Charm => charm.add(var, 1.0),
                 _ => {}
             }
 
@@ -277,15 +235,12 @@ impl Searcher {
             for i in 0..4 {
                 if weapon_slot_cond[i] != 0 {
                     weapon_slots[i].add(var, weapon_slot_cond[i] as f64);
-                    weapon_slot_terms[i] = true;
                 }
                 if armor_slot_cond[i] != 0 {
                     armor_slots[i].add(var, armor_slot_cond[i] as f64);
-                    armor_slot_terms[i] = true;
                 }
                 if all_slot_cond[i] != 0 {
                     all_slots[i].add(var, all_slot_cond[i] as f64);
-                    all_slot_terms[i] = true;
                 }
             }
 
@@ -296,31 +251,24 @@ impl Searcher {
             };
             if def_value != 0 {
                 def.add(var, def_value as f64);
-                def_terms = true;
             }
             if equip.fire != 0 {
                 fire.add(var, equip.fire as f64);
-                fire_terms = true;
             }
             if equip.water != 0 {
                 water.add(var, equip.water as f64);
-                water_terms = true;
             }
             if equip.thunder != 0 {
                 thunder.add(var, equip.thunder as f64);
-                thunder_terms = true;
             }
             if equip.ice != 0 {
                 ice.add(var, equip.ice as f64);
-                ice_terms = true;
             }
             if equip.dragon != 0 {
                 dragon.add(var, equip.dragon as f64);
-                dragon_terms = true;
             }
             if equip.kind == EquipKind::Weapon && equip.attack != 0 {
                 attack.add(var, equip.attack as f64);
-                attack_terms = true;
             }
 
             for cond_skill in &self.condition.skills {
@@ -331,9 +279,8 @@ impl Searcher {
                     }
                 }
                 if level != 0 {
-                    if let Some(expr) = skill_exprs.get_mut(&cond_skill.name) {
+                    if let Some(expr) = skills.get_mut(&cond_skill.name) {
                         expr.add(var, level as f64);
-                        skill_terms.insert(cond_skill.name.clone(), true);
                     }
                 }
             }
@@ -355,70 +302,56 @@ impl Searcher {
 
         let mut impossible = false;
         if self.condition.is_specific_weapon {
-            if weapon_terms {
-                problem.add_constraint(weapon, ComparisonOp::Eq, 1.0);
+            if weapon.has_terms {
+                problem.add_constraint(weapon.expr, ComparisonOp::Eq, 1.0);
             } else {
                 impossible = true;
             }
-        } else if weapon_terms {
-            problem.add_constraint(weapon, ComparisonOp::Le, 1.0);
+        } else if weapon.has_terms {
+            problem.add_constraint(weapon.expr, ComparisonOp::Le, 1.0);
         }
-        for (expr, has_terms) in [
-            (head, head_terms),
-            (body, body_terms),
-            (arm, arm_terms),
-            (waist, waist_terms),
-            (leg, leg_terms),
-            (charm, charm_terms),
-        ] {
-            if has_terms {
-                problem.add_constraint(expr, ComparisonOp::Le, 1.0);
+        for terms in [head, body, arm, waist, leg, charm] {
+            if terms.has_terms {
+                problem.add_constraint(terms.expr, ComparisonOp::Le, 1.0);
             }
         }
-        for i in 0..4 {
-            if weapon_slot_terms[i] {
-                problem.add_constraint(weapon_slots[i].clone(), ComparisonOp::Ge, 0.0);
-            }
-            if armor_slot_terms[i] {
-                problem.add_constraint(armor_slots[i].clone(), ComparisonOp::Ge, 0.0);
-            }
-            if all_slot_terms[i] {
-                problem.add_constraint(all_slots[i].clone(), ComparisonOp::Ge, 0.0);
+        for terms in weapon_slots.into_iter().chain(armor_slots).chain(all_slots) {
+            if terms.has_terms {
+                problem.add_constraint(terms.expr, ComparisonOp::Ge, 0.0);
             }
         }
         let required_def = self.condition.def.unwrap_or(0);
-        if def_terms {
-            problem.add_constraint(def, ComparisonOp::Ge, required_def as f64);
+        if def.has_terms {
+            problem.add_constraint(def.expr, ComparisonOp::Ge, required_def as f64);
         } else if required_def > 0 {
             impossible = true;
         }
-        for (expr, has_terms, value) in [
-            (fire, fire_terms, self.condition.fire),
-            (water, water_terms, self.condition.water),
-            (thunder, thunder_terms, self.condition.thunder),
-            (ice, ice_terms, self.condition.ice),
-            (dragon, dragon_terms, self.condition.dragon),
+        for (terms, value) in [
+            (fire, self.condition.fire),
+            (water, self.condition.water),
+            (thunder, self.condition.thunder),
+            (ice, self.condition.ice),
+            (dragon, self.condition.dragon),
         ] {
             if let Some(value) = value {
-                if has_terms {
-                    problem.add_constraint(expr, ComparisonOp::Ge, value as f64);
+                if terms.has_terms {
+                    problem.add_constraint(terms.expr, ComparisonOp::Ge, value as f64);
                 } else if value > 0 {
                     impossible = true;
                 }
             }
         }
         let required_attack = self.condition.min_attack.unwrap_or(0);
-        if attack_terms {
-            problem.add_constraint(attack, ComparisonOp::Ge, required_attack as f64);
+        if attack.has_terms {
+            problem.add_constraint(attack.expr, ComparisonOp::Ge, required_attack as f64);
         } else if required_attack > 0 {
             impossible = true;
         }
 
         for skill in &self.condition.skills {
-            let has_terms = *skill_terms.get(&skill.name).unwrap_or(&false);
-            let expr = skill_exprs
-                .remove(&skill.name)
-                .unwrap_or_else(LinearExpr::empty);
+            let terms = skills.remove(&skill.name).unwrap_or_else(Terms::new);
+            let has_terms = terms.has_terms;
+            let expr = terms.expr;
             let lower = skill.level as f64;
             let mut upper = f64::INFINITY;
             if skill.is_fixed {
@@ -584,6 +517,25 @@ impl Searcher {
                 && is_duplicate_equip_name(&new_set.leg.name, &set.leg.name)
                 && is_duplicate_equip_name(&new_set.charm.name, &set.charm.name))
         });
+    }
+}
+
+struct Terms {
+    expr: LinearExpr,
+    has_terms: bool,
+}
+
+impl Terms {
+    fn new() -> Terms {
+        Terms {
+            expr: LinearExpr::empty(),
+            has_terms: false,
+        }
+    }
+
+    fn add(&mut self, var: Variable, coef: f64) {
+        self.expr.add(var, coef);
+        self.has_terms = true;
     }
 }
 

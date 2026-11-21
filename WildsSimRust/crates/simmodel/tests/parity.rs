@@ -25,12 +25,17 @@ fn copy_dir(source: &Path, target: &Path) {
     }
 }
 
-fn setup() -> (TestRoot, Simulator) {
+fn fresh_root() -> TestRoot {
     let root = TestRoot {
         path: std::env::temp_dir().join(format!("wildssim-parity-{}", uuid::Uuid::new_v4())),
     };
     let testdata = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
     copy_dir(&testdata, &root.path);
+    root
+}
+
+fn setup() -> (TestRoot, Simulator) {
+    let root = fresh_root();
     let simulator = Simulator::load(&root.path).unwrap();
     (root, simulator)
 }
@@ -62,6 +67,25 @@ fn find_charm<'a>(simulator: &'a Simulator, disp_name: &str) -> &'a Equipment {
         .iter()
         .find(|charm| charm.disp_name() == disp_name)
         .unwrap_or_else(|| panic!("charm not found: {}", disp_name))
+}
+
+#[test]
+fn load_does_not_rewrite_save_files() {
+    let root = fresh_root();
+    std::fs::write(
+        root.path.join("conf/LogicConfig.csv"),
+        "スロットの最大の大きさ,最近使ったスキルの記憶容量,追加護石のスキル最大個数,入手不可装備の利用有無,下位互換護石の検出有無,最大並列処理数,アーティア武器のスキル数\n3,20,2,false,true,1,3\n",
+    )
+    .unwrap();
+    let charms = "スキル系統1,スキル値1,スキル系統2,スキル値2,スキル系統3,スキル値3,スロット1,スロット2,スロット3,スロット1タイプ,スロット2タイプ,スロット3タイプ,内部管理ID\n防具スキル,1,つよ防具スキル全,1,つよ防具スキル頭,1,0,0,0,0,0,0,three-skill-charm\n";
+    std::fs::write(root.path.join("save/additionalCharm.csv"), charms).unwrap();
+    let artians = "武器種,名前,スキル系統1,スキル値1,スキル系統2,スキル値2,スキル系統3,スキル値3,内部管理ID\n大剣,three-skill-artian,よわグループ,1,つよの力,1,,,three-skill-artian\n";
+    std::fs::write(root.path.join("save/artian.csv"), artians).unwrap();
+
+    let _simulator = Simulator::load(&root.path).unwrap();
+
+    assert_eq!(read(&root, "save/additionalCharm.csv"), charms);
+    assert_eq!(read(&root, "save/artian.csv"), artians);
 }
 
 #[test]
@@ -564,6 +588,18 @@ fn deco_count_persists() {
     let before = read(&root, "save/decocount.json");
     simulator.save_deco_count(&name, -4).unwrap();
     assert_eq!(read(&root, "save/decocount.json"), before);
+
+    simulator.set_all_deco_count(4).unwrap();
+    assert!(simulator
+        .masters
+        .decos
+        .iter()
+        .all(|deco| deco.deco_count == 4));
+    let reloaded = simulator
+        .file
+        .load_deco_csv(simulator.masters.skill_lookup())
+        .unwrap();
+    assert!(reloaded.iter().all(|deco| deco.deco_count == 4));
 }
 
 #[test]
@@ -660,6 +696,40 @@ fn charm_mutations() {
     simulator.move_charm(100, 2).unwrap();
     simulator.move_charm(1, 1).unwrap();
     assert_eq!(simulator.masters.additional_charms.len(), count);
+}
+
+#[test]
+fn add_charm_rejects_duplicate_skill_names() {
+    let (_root, mut simulator) = setup();
+    let before = simulator.masters.additional_charms.len();
+    let skill = simulator.masters.make_skill("防具スキル", 1);
+    let mut charm = Equipment::new(EquipKind::Charm);
+    charm.name = "duplicate-skill-charm".to_string();
+    charm.skills = vec![skill.clone(), skill];
+
+    let error = simulator.add_charm(charm).unwrap_err();
+    assert!(error.to_string().contains("重複"));
+    assert_eq!(simulator.masters.additional_charms.len(), before);
+    assert!(!simulator
+        .masters
+        .additional_charms
+        .iter()
+        .any(|charm| charm.name == "duplicate-skill-charm"));
+}
+
+#[test]
+fn add_artian_rejects_duplicate_skill_names() {
+    let (_root, mut simulator) = setup();
+    let before = simulator.masters.artians.len();
+    let skill = simulator.masters.make_skill("よわグループ", 1);
+    let mut artian = Equipment::new_weapon();
+    artian.init_artian();
+    artian.name = "duplicate-skill-artian".to_string();
+    artian.skills = vec![skill.clone(), skill];
+
+    let error = simulator.add_artian(artian).unwrap_err();
+    assert!(error.to_string().contains("重複"));
+    assert_eq!(simulator.masters.artians.len(), before);
 }
 
 #[test]
@@ -1074,10 +1144,6 @@ fn equip_set_reference_values() {
         ),
         (-25, -25, -25, -25, -40)
     );
-    assert_eq!(
-        set.glpk_row_name(),
-        "スロットのみ_0-0-0,つよ頭,つよ胴,つよ腕,つよ腰,,テスト護石Ⅰ"
-    );
     assert_eq!(set.existing_equips_without_decos().len(), 6);
 
     let set = find("ワンセット");
@@ -1099,16 +1165,8 @@ fn equip_set_reference_values() {
         "防二珠【２】,防二珠【２】,防二珠【２】,防二珠【２】,防二珠【２】"
     );
     assert_eq!(
-        set.deco_name_csv_multi_line(),
-        "防二珠【２】,\n防二珠【２】,防二珠【２】,\n防二珠【２】,防二珠【２】"
-    );
-    assert_eq!(
         set.skills_disp(),
         "防具スキルLv6, スロ2防具スキルLv5, 強欲Ⅱ(強欲の力Lv4), 激運(強欲グループLv3), つよ防具スキル頭Lv1, つよ防具スキル胴Lv1, つよ防具スキル腕Lv1, つよ防具スキル腰Lv1, つよ防具スキル足Lv1"
-    );
-    assert_eq!(
-        set.skills_disp_multi_line(),
-        "防具スキルLv6,スロ2防具スキルLv5,強欲Ⅱ(強欲の力Lv4),\n激運(強欲グループLv3),つよ防具スキル頭Lv1,つよ防具スキル胴Lv1,\nつよ防具スキル腕Lv1,つよ防具スキル腰Lv1,つよ防具スキル足Lv1"
     );
     assert_eq!(
         set.description(),
@@ -1340,37 +1398,12 @@ fn equipment_and_skill_reference_values() {
         ..Equipment::default()
     };
     assert_eq!(equip.disp_name(), "testname");
-    assert_eq!(equip.detail_disp_name(), "testname");
     let equip = Equipment {
         name: "testname".to_string(),
         disp_name: Some("dispname".to_string()),
         ..Equipment::default()
     };
     assert_eq!(equip.disp_name(), "dispname");
-    assert_eq!(equip.detail_disp_name(), "dispname");
-
-    let description = |name: &str| {
-        simulator
-            .masters
-            .all_equipments()
-            .into_iter()
-            .find(|equip| equip.name == name)
-            .map(|equip| equip.description())
-            .unwrap_or_else(|| Equipment::default().description())
-    };
-    assert_eq!(
-        description("つよ腕"),
-        "つよ腕,0-0-0\n防御:20→28→36,火:-10,水:-10,雷:5,氷:-10,龍:-10\nつよグループLv1\nつよの力Lv1\n防具スキルLv1\nつよ防具スキル全Lv1\nつよ防具スキル腕Lv1"
-    );
-    assert_eq!(
-        description("セット腕"),
-        "セット腕,2-1-0→3-2-1\n防御:15→25→35,火:0,水:0,雷:0,氷:0,龍:0\n強欲グループLv1\n強欲の力Lv1\n防具スキルLv1\nつよ防具スキル腕Lv1"
-    );
-    assert_eq!(
-        description("武一珠【１】"),
-        "武一珠【１】\nスロ1武器スキルLv1"
-    );
-    assert_eq!(description("dummy"), "");
 
     let simple = |name: &str| {
         simulator
@@ -1421,9 +1454,6 @@ fn equipment_and_skill_reference_values() {
     assert!(simulator.masters.is_skill_name("防具スキル"));
     assert!(!simulator.masters.is_skill_name(""));
     assert!(!simulator.masters.is_skill_name("dummy"));
-    assert_eq!(simulator.masters.skill_max_level("防具スキル"), 6);
-    assert_eq!(simulator.masters.skill_max_level("つよの力"), 4);
-    assert_eq!(simulator.masters.skill_max_level("dummy"), 0);
 
     assert_eq!(EquipKind::Weapon.as_str(), "武器");
     assert_eq!(EquipKind::Head.as_str(), "頭");
@@ -1435,8 +1465,6 @@ fn equipment_and_skill_reference_values() {
     assert_eq!(EquipKind::Charm.as_str(), "護石");
     assert_eq!(EquipKind::Error.as_str(), "");
     assert_eq!(EquipKind::Weapon.str_with_colon(), "武器：");
-    assert_eq!(EquipKind::from_str("脚"), EquipKind::Leg);
-    assert_eq!(EquipKind::from_str("dummy"), EquipKind::Error);
 
     let mut weapon = Equipment::new_weapon();
     weapon.init_artian();
@@ -1534,6 +1562,21 @@ fn save_clude_and_recent_match_reference_format() {
 }
 
 #[test]
+fn invalid_slot_size_is_rejected_before_search() {
+    let mut range = SearchRange::default();
+    let mut charm = Equipment::new(EquipKind::Charm);
+    charm.name = "invalid-slot-charm".to_string();
+    charm.slot1 = 5;
+    range.charms.push(charm);
+
+    let error = match Searcher::new(SearchCondition::new(), range) {
+        Ok(_) => panic!("slot size 5 must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("スロットサイズ"));
+}
+
+#[test]
 fn logic_config_defaults_and_errors() {
     let (_root, simulator) = setup();
     assert_eq!(simulator.logic.max_slot_size, 3);
@@ -1553,8 +1596,55 @@ fn logic_config_defaults_and_errors() {
     assert_eq!(config.max_recent_skill_count, 20);
     assert_eq!(config.max_charm_skill_count, 3);
     assert_eq!(config.artian_skill_count, 2);
+    std::fs::write(
+        root.join("conf/LogicConfig.csv"),
+        "スロットの最大の大きさ\n5\n",
+    )
+    .unwrap();
+    assert!(LogicConfig::load(&root.join("conf/LogicConfig.csv")).is_err());
     assert!(LogicConfig::load(&root.join("conf/missing.csv")).is_err());
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn malformed_csv_is_an_error_not_empty_rows() {
+    let root = fresh_root();
+    // A truncated row is not skipped: load fails instead of starting with a
+    // partially empty my set that the next save would silently persist.
+    std::fs::write(
+        root.path.join("save/myset.csv"),
+        "武器,頭,胴,腕,腰,足,護石,装飾品,名前,限界突破有無\r\ngun,head\r\n",
+    )
+    .unwrap();
+    assert!(
+        simmodel::file_operation::FileOperation::new(&root.path, LogicConfig::default())
+            .load_my_set_csv(&[])
+            .is_err()
+    );
+}
+
+#[test]
+fn my_set_keeps_names_of_missing_equipment() {
+    let root = fresh_root();
+    std::fs::write(
+        root.path.join("save/myset.csv"),
+        "武器,頭,胴,腕,腰,足,護石,装飾品,名前,限界突破有無\r\ngone-weapon,gone-head,gone-body,gone-arm,gone-waist,gone-leg,gone-charm,\"gone-deco1,gone-deco2\",myset,\r\n",
+    )
+    .unwrap();
+    let simulator = Simulator::load(&root.path).unwrap();
+    let set = simulator
+        .masters
+        .my_sets
+        .iter()
+        .find(|set| set.name == "myset")
+        .expect("myset");
+    assert_eq!(set.head.name, "gone-head");
+    assert_eq!(set.head.kind, EquipKind::Head);
+    assert_eq!(set.weapon.name, "gone-weapon");
+    assert_eq!(set.weapon.kind, EquipKind::Weapon);
+    assert_eq!(set.decos.len(), 2);
+    assert_eq!(set.decos[0].name, "gone-deco1");
+    assert_eq!(set.decos[0].kind, EquipKind::Deco);
 }
 
 #[test]

@@ -24,7 +24,3 @@ impl From<csv::Error> for SimError {
 }
 
 pub type SimResult<T> = Result<T, SimError>;
-
-pub fn err<T>(message: impl Into<String>) -> SimResult<T> {
-    Err(SimError(message.into()))
-}

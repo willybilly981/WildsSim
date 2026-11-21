@@ -85,9 +85,11 @@ const FILES: [(&str, &[u8]); 20] = [
 
 const EXTRACT_DIR: &str = "WildsSimData";
 
-pub fn resolve_data_root() -> PathBuf {
+pub fn resolve_data_root() -> Result<PathBuf, String> {
     if let Ok(root) = std::env::var("WILDSSIM_DATA_DIR") {
-        return PathBuf::from(root);
+        if !root.trim().is_empty() {
+            return Ok(PathBuf::from(root));
+        }
     }
     let exe_dir = std::env::current_exe()
         .ok()
@@ -97,7 +99,7 @@ pub fn resolve_data_root() -> PathBuf {
     // hold another copy of the data silently switched where saves were written.
     if let Some(dir) = &exe_dir {
         if dir.join("MHWilds_SKILL.csv").exists() {
-            return dir.clone();
+            return Ok(dir.clone());
         }
     }
     #[cfg(debug_assertions)]
@@ -107,7 +109,7 @@ pub fn resolve_data_root() -> PathBuf {
             .join("simmodel")
             .join("data");
         if source.join("MHWilds_SKILL.csv").exists() {
-            return source;
+            return Ok(source);
         }
     }
     // %TEMP% is last because Storage Sense and cleanup tools delete it, taking the
@@ -118,13 +120,34 @@ pub fn resolve_data_root() -> PathBuf {
         Some(std::env::temp_dir().join(EXTRACT_DIR)),
     ];
     let mut last = None;
+    let mut first_error = None;
     for root in candidates.into_iter().flatten() {
-        if prepare(&root).is_ok() {
-            return root;
+        match prepare(&root) {
+            Ok(()) => return Ok(root),
+            Err(error) => {
+                // A folder that already holds user saves must not be abandoned
+                // on a transient failure (file lock, AV scan): falling through
+                // to %TEMP% would hide the data and risk losing new saves.
+                if root.join("save").is_dir() {
+                    return Err(format!(
+                        "データフォルダ {} の展開に失敗しました。: {}",
+                        root.display(),
+                        error
+                    ));
+                }
+                if first_error.is_none() {
+                    first_error = Some(format!("{}: {}", root.display(), error));
+                }
+                last = Some(root);
+            }
         }
-        last = Some(root);
     }
-    last.unwrap_or_else(|| std::env::temp_dir().join(EXTRACT_DIR))
+    match last {
+        Some(root) => Ok(root),
+        None => {
+            Err(first_error.unwrap_or_else(|| "データフォルダを決定できませんでした".to_string()))
+        }
+    }
 }
 
 fn is_master(relative: &str) -> bool {
@@ -162,7 +185,7 @@ mod tests {
     }
 
     fn temp_root() -> TempDir {
-        TempDir(std::env::temp_dir().join(format!("wildssim-data-{}", uuid::Uuid::new_v4())))
+        TempDir(std::env::temp_dir().join(format!("wildssim-data-{}", simmodel::Uuid::new_v4())))
     }
 
     fn embedded(relative: &str) -> &'static [u8] {

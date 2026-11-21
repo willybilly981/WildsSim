@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use uuid::Uuid;
 
@@ -35,21 +34,6 @@ impl EquipKind {
         format!("{}：", self.as_str())
     }
 
-    pub fn from_str(s: &str) -> EquipKind {
-        match s {
-            "武器" => EquipKind::Weapon,
-            "頭" => EquipKind::Head,
-            "胴" => EquipKind::Body,
-            "腕" => EquipKind::Arm,
-            "腰" => EquipKind::Waist,
-            "足" => EquipKind::Leg,
-            "脚" => EquipKind::Leg,
-            "装飾品" => EquipKind::Deco,
-            "護石" => EquipKind::Charm,
-            _ => EquipKind::Error,
-        }
-    }
-
     pub fn is_armor(self) -> bool {
         matches!(
             self,
@@ -58,8 +42,9 @@ impl EquipKind {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum CludeKind {
+    #[default]
     Exclude,
     Include,
 }
@@ -353,10 +338,6 @@ impl Equipment {
         }
     }
 
-    pub fn detail_disp_name(&self) -> &str {
-        self.disp_name()
-    }
-
     pub fn transcending_def(&self) -> i32 {
         self.transcending_def.unwrap_or(self.maxdef)
     }
@@ -391,57 +372,6 @@ impl Equipment {
         } else {
             self.slot3
         }
-    }
-
-    pub fn description(&self) -> String {
-        if self.name.trim().is_empty() {
-            return String::new();
-        }
-        let mut sb = String::new();
-        sb.push_str(self.disp_name());
-        if self.kind != EquipKind::Deco {
-            sb.push(',');
-            sb.push_str(&self.slot1.to_string());
-            sb.push('-');
-            sb.push_str(&self.slot2.to_string());
-            sb.push('-');
-            sb.push_str(&self.slot3.to_string());
-            if self.is_transcending_slot_target() {
-                sb.push('→');
-                sb.push_str(&self.transcending_slot1().to_string());
-                sb.push('-');
-                sb.push_str(&self.transcending_slot2().to_string());
-                sb.push('-');
-                sb.push_str(&self.transcending_slot3().to_string());
-            }
-            sb.push('\n');
-            sb.push_str("防御:");
-            sb.push_str(&self.mindef.to_string());
-            sb.push('→');
-            sb.push_str(&self.maxdef.to_string());
-            sb.push('→');
-            sb.push_str(&self.transcending_def().to_string());
-            sb.push(',');
-            sb.push_str("火:");
-            sb.push_str(&self.fire.to_string());
-            sb.push(',');
-            sb.push_str("水:");
-            sb.push_str(&self.water.to_string());
-            sb.push(',');
-            sb.push_str("雷:");
-            sb.push_str(&self.thunder.to_string());
-            sb.push(',');
-            sb.push_str("氷:");
-            sb.push_str(&self.ice.to_string());
-            sb.push(',');
-            sb.push_str("龍:");
-            sb.push_str(&self.dragon.to_string());
-        }
-        for skill in &self.skills {
-            sb.push('\n');
-            sb.push_str(&skill.description());
-        }
-        sb
     }
 
     pub fn simple_description(&self) -> String {
@@ -485,13 +415,13 @@ impl Equipment {
             disp.push_str(", ");
         }
         disp.push_str(&self.slot1.to_string());
-        disp.push_str(&slot_type_suffix(self.slot1, self.slot_type1));
+        disp.push_str(slot_type_suffix(self.slot1, self.slot_type1));
         disp.push('-');
         disp.push_str(&self.slot2.to_string());
-        disp.push_str(&slot_type_suffix(self.slot2, self.slot_type2));
+        disp.push_str(slot_type_suffix(self.slot2, self.slot_type2));
         disp.push('-');
         disp.push_str(&self.slot3.to_string());
-        disp.push_str(&slot_type_suffix(self.slot3, self.slot_type3));
+        disp.push_str(slot_type_suffix(self.slot3, self.slot_type3));
         self.disp_name = Some(disp);
     }
 
@@ -532,16 +462,10 @@ pub struct CharmCombo {
     pub slot_type3: i32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Clude {
     pub name: String,
     pub kind: CludeKind,
-}
-
-impl Default for CludeKind {
-    fn default() -> Self {
-        CludeKind::Exclude
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -643,21 +567,8 @@ impl EquipSet {
                 skill.level = skill.max_level;
             }
         }
-        ret.sort_by(|a, b| b.level.cmp(&a.level));
+        ret.sort_by_key(|s| std::cmp::Reverse(s.level));
         ret
-    }
-
-    pub fn glpk_row_name(&self) -> String {
-        format!(
-            "{},{},{},{},{},{},{}",
-            self.weapon.name,
-            self.head.name,
-            self.body.name,
-            self.arm.name,
-            self.waist.name,
-            self.leg.name,
-            self.charm.name
-        )
     }
 
     pub fn existing_equips_without_decos(&self) -> Vec<&Equipment> {
@@ -686,26 +597,6 @@ impl EquipSet {
             .join(",")
     }
 
-    pub fn deco_name_csv_multi_line(&self) -> String {
-        let mut sb = String::new();
-        let second_line_idx = self.decos.len() / 3;
-        let third_line_idx = self.decos.len() * 2 / 3;
-        for (i, deco) in self.decos.iter().enumerate() {
-            if i == 0 {
-            } else if i == second_line_idx {
-                sb.push(',');
-                sb.push('\n');
-            } else if i == third_line_idx {
-                sb.push(',');
-                sb.push('\n');
-            } else {
-                sb.push(',');
-            }
-            sb.push_str(&deco.name);
-        }
-        sb
-    }
-
     pub fn skills_disp(&self) -> String {
         self.skills()
             .iter()
@@ -713,27 +604,6 @@ impl EquipSet {
             .map(|s| s.description())
             .collect::<Vec<_>>()
             .join(", ")
-    }
-
-    pub fn skills_disp_multi_line(&self) -> String {
-        let exist_skill: Vec<Skill> = self.skills().into_iter().filter(|s| s.level > 0).collect();
-        let mut sb = String::new();
-        let second_line_idx = exist_skill.len() / 3;
-        let third_line_idx = exist_skill.len() * 2 / 3;
-        for (i, skill) in exist_skill.iter().enumerate() {
-            if i == 0 {
-            } else if i == second_line_idx {
-                sb.push(',');
-                sb.push('\n');
-            } else if i == third_line_idx {
-                sb.push(',');
-                sb.push('\n');
-            } else {
-                sb.push(',');
-            }
-            sb.push_str(&skill.description());
-        }
-        sb
     }
 
     pub fn description(&self) -> String {
@@ -795,6 +665,12 @@ impl EquipSet {
                 if deco.slot1 == i {
                     new_decos.push(deco.clone());
                 }
+            }
+        }
+        // Unknown decos kept by name (no master data, slot 0) must not vanish.
+        for deco in &self.decos {
+            if !(1..=4).contains(&deco.slot1) {
+                new_decos.push(deco.clone());
             }
         }
         self.decos = new_decos;
@@ -1007,6 +883,7 @@ impl SearchCondition {
         charm_groups: &HashMap<i32, Vec<Skill>>,
     ) -> Vec<Equipment> {
         let mut target_charms: Vec<Equipment> = Vec::new();
+        let mut seen_charms = HashSet::new();
         let cond_skills: Vec<&Skill> = self.skills.iter().filter(|s| s.level != 0).collect();
         let empty: Vec<Skill> = Vec::new();
         for combo in charm_combos {
@@ -1058,14 +935,23 @@ impl SearchCondition {
                             }
                         }
                         charm.set_charm_disp_name();
-                        let mut is_exist = false;
-                        for exist in &target_charms {
-                            if is_same_charm(&charm, exist) {
-                                is_exist = true;
-                                break;
-                            }
-                        }
-                        if !is_exist {
+                        let mut skills: Vec<(String, i32)> = charm
+                            .skills
+                            .iter()
+                            .map(|skill| (skill.name.clone(), skill.level))
+                            .collect();
+                        skills.sort();
+                        // Slot position does not matter to the solver; the same
+                        // (size, type) multiset in a different order is an
+                        // equivalent charm, not a new candidate.
+                        let mut slots = [
+                            (charm.slot1, charm.slot_type1),
+                            (charm.slot2, charm.slot_type2),
+                            (charm.slot3, charm.slot_type3),
+                        ];
+                        slots.sort();
+                        let key = (slots, skills);
+                        if seen_charms.insert(key) {
                             target_charms.push(charm);
                         }
                     }
@@ -1131,31 +1017,6 @@ impl SearchCondition {
     }
 }
 
-fn is_same_charm(left: &Equipment, right: &Equipment) -> bool {
-    if left.skills.len() != right.skills.len() {
-        return false;
-    }
-    if left.slot1 != right.slot1
-        || left.slot2 != right.slot2
-        || left.slot3 != right.slot3
-        || left.slot_type1 != right.slot_type1
-        || left.slot_type2 != right.slot_type2
-        || left.slot_type3 != right.slot_type3
-    {
-        return false;
-    }
-    for skill in &left.skills {
-        if !right
-            .skills
-            .iter()
-            .any(|s| s.name == skill.name && s.level == skill.level)
-        {
-            return false;
-        }
-    }
-    true
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct SearchRange {
     pub weapons: Vec<Equipment>,
@@ -1167,12 +1028,6 @@ pub struct SearchRange {
     pub charms: Vec<Equipment>,
     pub decos: Vec<Equipment>,
     pub cludes: Vec<Clude>,
-}
-
-impl SearchRange {
-    pub fn new_empty() -> SearchRange {
-        SearchRange::default()
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1239,19 +1094,10 @@ impl Masters {
         }
         self.skills.iter().any(|skill| skill.name == name)
     }
-
-    pub fn skill_max_level(&self, name: &str) -> i32 {
-        for skill in &self.skills {
-            if skill.name == name {
-                return skill.level;
-            }
-        }
-        0
-    }
 }
 
 pub fn build_search_range(condition: &SearchCondition, masters: &Masters) -> SearchRange {
-    let mut range = SearchRange::new_empty();
+    let mut range = SearchRange::default();
     if condition.is_specific_weapon {
         if let Some(weapon_name) = &condition.weapon_name {
             if let Some(weapon) = masters

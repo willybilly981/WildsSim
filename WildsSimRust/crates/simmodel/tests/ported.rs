@@ -103,6 +103,41 @@ fn search_limit() {
 }
 
 #[test]
+fn related_charms_dedupe_slot_permutations() {
+    // The same (size, type) multiset in a different slot order is one
+    // equivalent charm, not two candidates.
+    let combos = vec![
+        CharmCombo {
+            rare: 8,
+            group1: 0,
+            group2: 0,
+            group3: 0,
+            slot1: 2,
+            slot2: 1,
+            slot3: 0,
+            slot_type1: 0,
+            slot_type2: 1,
+            slot_type3: 0,
+        },
+        CharmCombo {
+            rare: 8,
+            group1: 0,
+            group2: 0,
+            group3: 0,
+            slot1: 1,
+            slot2: 2,
+            slot3: 0,
+            slot_type1: 1,
+            slot_type2: 0,
+            slot_type3: 0,
+        },
+    ];
+    let condition = SearchCondition::new();
+    let charms = condition.make_related_charms(&combos, &std::collections::HashMap::new());
+    assert_eq!(charms.len(), 1);
+}
+
+#[test]
 fn search_zero_or_negative_limit_adds_nothing() {
     let (_root, simulator) = setup();
     let condition = condition_with(
@@ -400,25 +435,27 @@ fn search_invalid_names() {
 }
 
 #[test]
-fn simulator_search_more() {
-    let (_root, mut simulator) = setup();
+fn searcher_search_more() {
+    let (_root, simulator) = setup();
     let condition = condition_with(
         &simulator,
         &[("防具スキル", 6), ("つよ防具スキル全", 4)],
         &[],
         Some("スロットのみ_0-0-0"),
     );
-    let result1 = simulator.search(condition, 3, None).unwrap();
-    assert_eq!(result1.len(), 3);
-    let result2 = simulator.search_more(2, None).unwrap();
-    assert_eq!(result2.len(), 5);
-    let result3 = simulator.search_more(2, None).unwrap();
-    assert_eq!(result3.len(), 6);
+    let range = build_search_range(&condition, &simulator.masters);
+    let mut searcher = Searcher::new(condition, range).unwrap();
+    searcher.exec_search(3, None).unwrap();
+    assert_eq!(searcher.result_sets.len(), 3);
+    searcher.exec_search(2, None).unwrap();
+    assert_eq!(searcher.result_sets.len(), 5);
+    searcher.exec_search(2, None).unwrap();
+    assert_eq!(searcher.result_sets.len(), 6);
 }
 
 #[test]
-fn simulator_extra_skill() {
-    let (_root, mut simulator) = setup();
+fn extra_skill_search_skips_hidden_levels() {
+    let (_root, simulator) = setup();
     let condition = condition_with(
         &simulator,
         &[
@@ -432,10 +469,16 @@ fn simulator_extra_skill() {
     );
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let progress = std::sync::atomic::AtomicUsize::new(0);
-    let result = simulator
-        .search_extra_skill(&condition, &cancel, Some(&progress))
-        .unwrap();
-    assert_eq!(result.len(), 10);
+    let result = simmodel::simulator::search_extra_skill_impl(
+        &simulator.masters,
+        &simulator.logic,
+        &condition,
+        &cancel,
+        Some(&progress),
+    )
+    .unwrap();
+    // Group/series levels that never activate are not offered and not solved.
+    assert_eq!(result.len(), 7);
     for (name, level) in [
         ("つよ防具スキル全", 1),
         ("つよ防具スキル全", 2),
@@ -444,9 +487,6 @@ fn simulator_extra_skill() {
         ("つよ防具スキル腕", 1),
         ("つよ防具スキル腰", 1),
         ("つよ防具スキル足", 1),
-        ("よわの力", 3),
-        ("つよグループ", 1),
-        ("つよグループ", 2),
     ] {
         assert!(
             result.iter().any(|s| s.name == name && s.level == level),
@@ -462,9 +502,9 @@ fn simulator_extra_skill() {
 }
 
 #[test]
-fn simulator_charm_search() {
-    let (_root, mut simulator) = setup();
-    let mut condition = condition_with(
+fn charm_search_impl() {
+    let (_root, simulator) = setup();
+    let condition = condition_with(
         &simulator,
         &[
             ("防具スキル", 6),
@@ -474,23 +514,31 @@ fn simulator_charm_search() {
         &[],
         Some("スロットのみ_0-0-0"),
     );
-    simulator.masters.cludes.push(Clude {
+    let mut masters = simulator.masters.clone();
+    masters.cludes.push(Clude {
         name: "テスト護石Ⅰ".to_string(),
         kind: CludeKind::Include,
     });
-    let result1 = simulator.search(condition.clone(), 10, None).unwrap();
-    assert!(result1.is_empty());
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let result2 = simulator.search_charm(&cancel, None).unwrap();
-    assert_eq!(result2.len(), 1);
-    assert!(result2[0].charm.is_virtual);
-    condition.skills.clear();
-}
+    let result = simmodel::simulator::search_charm_impl(
+        &masters,
+        &simulator.logic,
+        &condition,
+        &cancel,
+        None,
+    )
+    .unwrap();
+    assert_eq!(result.len(), 1);
+    assert!(result[0].charm.is_virtual);
 
-#[test]
-fn simulator_charm_without_search() {
-    let (_root, mut simulator) = setup();
-    let cancel = std::sync::atomic::AtomicBool::new(false);
-    let result = simulator.search_charm(&cancel, None).unwrap();
+    let canceled = std::sync::atomic::AtomicBool::new(true);
+    let result = simmodel::simulator::search_charm_impl(
+        &masters,
+        &simulator.logic,
+        &condition,
+        &canceled,
+        None,
+    )
+    .unwrap();
     assert!(result.is_empty());
 }

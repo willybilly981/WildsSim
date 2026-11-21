@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
-use crate::charm_appraiser::{has_upper_charm, is_left_upper};
+use crate::charm_appraiser::{is_left_upper, upper_info_for};
 use crate::config::{LogicConfig, ViewConfig};
 use crate::error::{SimError, SimResult};
 use crate::file_operation::*;
@@ -17,8 +17,6 @@ pub struct Simulator {
     pub view: ViewConfig,
     pub file: FileOperation,
     searcher: Option<Searcher>,
-    pub is_searched_all: bool,
-    pub is_canceling: bool,
 }
 
 impl Simulator {
@@ -34,8 +32,6 @@ impl Simulator {
             view,
             file,
             searcher: None,
-            is_searched_all: false,
-            is_canceling: false,
         })
     }
 
@@ -46,90 +42,6 @@ impl Simulator {
             .unwrap_or(false)
     }
 
-    pub fn is_best_artian_search(&self) -> bool {
-        self.searcher
-            .as_ref()
-            .map(|searcher| searcher.condition.is_best_artian_search)
-            .unwrap_or(false)
-    }
-
-    pub fn current_result_sets(&self) -> Vec<EquipSet> {
-        self.searcher
-            .as_ref()
-            .map(|searcher| searcher.result_sets.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn search(
-        &mut self,
-        condition: SearchCondition,
-        limit: i32,
-        cancel: Option<&AtomicBool>,
-    ) -> SimResult<Vec<EquipSet>> {
-        self.is_canceling = false;
-        let range = build_search_range(&condition, &self.masters);
-        let skills = condition.skills.clone();
-        let mut searcher = Searcher::new(condition, range)?;
-        self.is_searched_all = searcher.exec_search(limit, cancel)?;
-        if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-            self.is_canceling = true;
-        }
-        let result = searcher.result_sets.clone();
-        self.searcher = Some(searcher);
-        self.update_recent_skill(&skills)?;
-        Ok(result)
-    }
-
-    pub fn search_more(
-        &mut self,
-        limit: i32,
-        cancel: Option<&AtomicBool>,
-    ) -> SimResult<Vec<EquipSet>> {
-        self.is_canceling = false;
-        let searcher = match self.searcher.as_mut() {
-            Some(searcher) => searcher,
-            None => return Ok(Vec::new()),
-        };
-        self.is_searched_all = searcher.exec_search(limit, cancel)?;
-        if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-            self.is_canceling = true;
-        }
-        Ok(searcher.result_sets.clone())
-    }
-
-    pub fn search_extra_skill(
-        &mut self,
-        condition: &SearchCondition,
-        cancel: &AtomicBool,
-        progress: Option<&AtomicUsize>,
-    ) -> SimResult<Vec<Skill>> {
-        self.is_canceling = false;
-        let result =
-            search_extra_skill_impl(&self.masters, &self.logic, condition, cancel, progress)?;
-        if cancel.load(Ordering::Relaxed) {
-            self.is_canceling = true;
-        }
-        Ok(result)
-    }
-
-    pub fn search_charm(
-        &mut self,
-        cancel: &AtomicBool,
-        progress: Option<&AtomicUsize>,
-    ) -> SimResult<Vec<EquipSet>> {
-        self.is_canceling = false;
-        let searcher = match self.searcher.as_ref() {
-            Some(searcher) => searcher,
-            None => return Ok(Vec::new()),
-        };
-        let condition = searcher.condition.clone();
-        let filtered = search_charm_impl(&self.masters, &self.logic, &condition, cancel, progress)?;
-        if cancel.load(Ordering::Relaxed) {
-            self.is_canceling = true;
-        }
-        Ok(filtered)
-    }
-
     pub fn add_exclude(&mut self, name: &str) -> SimResult<Option<Clude>> {
         let equip = match self.masters.get_equip_by_name(name) {
             Some(equip) => equip.clone(),
@@ -138,7 +50,24 @@ impl Simulator {
         if equip.kind == EquipKind::Weapon && equip.weapon_type == WeaponType::None {
             return Ok(None);
         }
-        self.add_clude(&equip.name, CludeKind::Exclude, true)
+        let mut cludes = self.masters.cludes.clone();
+        for clude in &mut cludes {
+            if clude.name == equip.name {
+                clude.kind = CludeKind::Exclude;
+            }
+        }
+        if !cludes.iter().any(|clude| clude.name == equip.name) {
+            cludes.push(Clude {
+                name: equip.name.clone(),
+                kind: CludeKind::Exclude,
+            });
+        }
+        let result = cludes
+            .iter()
+            .find(|clude| clude.name == equip.name)
+            .cloned();
+        self.commit_cludes(cludes)?;
+        Ok(result)
     }
 
     pub fn add_include(&mut self, name: &str) -> SimResult<Option<Clude>> {
@@ -149,86 +78,96 @@ impl Simulator {
         if equip.kind == EquipKind::Deco || equip.kind == EquipKind::Weapon {
             return Ok(None);
         }
-        let mut to_delete = Vec::new();
-        for clude in &self.masters.cludes {
-            if clude.kind == CludeKind::Exclude {
-                continue;
-            }
-            match self.masters.get_equip_by_name(&clude.name) {
-                None => to_delete.push(clude.name.clone()),
-                Some(old) if old.kind == equip.kind => to_delete.push(clude.name.clone()),
-                _ => {}
-            }
-        }
-        for name in to_delete {
-            self.delete_clude(&name, false)?;
-        }
-        self.add_clude(&equip.name, CludeKind::Include, true)
-    }
-
-    fn add_clude(&mut self, name: &str, kind: CludeKind, save: bool) -> SimResult<Option<Clude>> {
-        let mut found = false;
-        let mut result = None;
-        for clude in &mut self.masters.cludes {
-            if clude.name == name {
-                clude.kind = kind;
-                found = true;
-                result = Some(clude.clone());
+        // Only one include per part, and stale includes are dropped, all in one save.
+        let mut cludes: Vec<Clude> = self
+            .masters
+            .cludes
+            .iter()
+            .filter(|clude| {
+                clude.kind == CludeKind::Exclude
+                    || self
+                        .masters
+                        .get_equip_by_name(&clude.name)
+                        .map(|old| old.kind != equip.kind)
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        for clude in &mut cludes {
+            if clude.name == equip.name {
+                clude.kind = CludeKind::Include;
             }
         }
-        if !found {
-            let clude = Clude {
-                name: name.to_string(),
-                kind,
-            };
-            self.masters.cludes.push(clude.clone());
-            result = Some(clude);
+        if !cludes.iter().any(|clude| clude.name == equip.name) {
+            cludes.push(Clude {
+                name: equip.name.clone(),
+                kind: CludeKind::Include,
+            });
         }
-        if save {
-            self.file.save_clude_csv(&self.masters.cludes)?;
-        }
+        let result = cludes
+            .iter()
+            .find(|clude| clude.name == equip.name)
+            .cloned();
+        self.file.save_clude_csv(&cludes)?;
+        self.masters.cludes = cludes;
         Ok(result)
     }
 
-    pub fn delete_clude(&mut self, name: &str, save: bool) -> SimResult<()> {
-        if let Some(index) = self.masters.cludes.iter().position(|c| c.name == name) {
-            self.masters.cludes.remove(index);
-        }
-        if save {
-            self.file.save_clude_csv(&self.masters.cludes)?;
-        }
+    fn commit_cludes(&mut self, cludes: Vec<Clude>) -> SimResult<()> {
+        self.file.save_clude_csv(&cludes)?;
+        self.masters.cludes = cludes;
         Ok(())
     }
 
+    pub fn delete_clude(&mut self, name: &str, save: bool) -> SimResult<()> {
+        if !save {
+            self.masters.cludes.retain(|clude| clude.name != name);
+            return Ok(());
+        }
+        let cludes: Vec<Clude> = self
+            .masters
+            .cludes
+            .iter()
+            .filter(|clude| clude.name != name)
+            .cloned()
+            .collect();
+        self.commit_cludes(cludes)
+    }
+
     pub fn delete_all_clude(&mut self) -> SimResult<()> {
-        self.masters.cludes.clear();
-        self.file.save_clude_csv(&self.masters.cludes)
+        self.commit_cludes(Vec::new())
     }
 
     pub fn delete_all_armor_clude(&mut self) -> SimResult<()> {
-        let mut weapon_cludes = Vec::new();
-        for clude in &self.masters.cludes {
-            match self.masters.get_equip_by_name(&clude.name) {
-                None => weapon_cludes.push(clude.clone()),
-                Some(equip) if equip.kind == EquipKind::Weapon => weapon_cludes.push(clude.clone()),
-                _ => {}
-            }
-        }
-        self.masters.cludes = weapon_cludes;
-        self.file.save_clude_csv(&self.masters.cludes)
+        let cludes: Vec<Clude> = self
+            .masters
+            .cludes
+            .iter()
+            .filter(|clude| {
+                self.masters
+                    .get_equip_by_name(&clude.name)
+                    .map(|equip| equip.kind == EquipKind::Weapon)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        self.commit_cludes(cludes)
     }
 
     pub fn delete_all_weapon_clude(&mut self) -> SimResult<()> {
-        let mut armor_cludes = Vec::new();
-        for clude in &self.masters.cludes {
-            match self.masters.get_equip_by_name(&clude.name) {
-                None => armor_cludes.push(clude.clone()),
-                Some(equip) if equip.kind != EquipKind::Weapon => armor_cludes.push(clude.clone()),
-                _ => {}
-            }
-        }
-        self.masters.cludes = armor_cludes;
-        self.file.save_clude_csv(&self.masters.cludes)
+        let cludes: Vec<Clude> = self
+            .masters
+            .cludes
+            .iter()
+            .filter(|clude| {
+                self.masters
+                    .get_equip_by_name(&clude.name)
+                    .map(|equip| equip.kind != EquipKind::Weapon)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        self.commit_cludes(cludes)
     }
 
     pub fn add_my_set(&mut self, mut set: EquipSet) -> SimResult<Option<EquipSet>> {
@@ -255,8 +194,9 @@ impl Simulator {
         if set.name.is_empty() {
             set.name = self.logic.default_my_set_name.clone();
         }
-        self.masters.my_sets.push(set.clone());
-        self.save_my_set()?;
+        let mut my_sets = self.masters.my_sets.clone();
+        my_sets.push(set.clone());
+        self.commit_my_sets(my_sets)?;
         Ok(Some(set))
     }
 
@@ -264,8 +204,9 @@ impl Simulator {
         if index >= self.masters.my_sets.len() {
             return Ok(());
         }
-        self.masters.my_sets.remove(index);
-        self.save_my_set()
+        let mut my_sets = self.masters.my_sets.clone();
+        my_sets.remove(index);
+        self.commit_my_sets(my_sets)
     }
 
     pub fn move_my_set(&mut self, drop_index: usize, target_index: usize) -> SimResult<()> {
@@ -273,9 +214,10 @@ impl Simulator {
         if drop_index >= count || target_index >= count || drop_index == target_index {
             return Ok(());
         }
-        let set = self.masters.my_sets.remove(drop_index);
-        self.masters.my_sets.insert(target_index, set);
-        self.save_my_set()
+        let mut my_sets = self.masters.my_sets.clone();
+        let set = my_sets.remove(drop_index);
+        my_sets.insert(target_index, set);
+        self.commit_my_sets(my_sets)
     }
 
     pub fn change_name_of_my_set(&mut self, name: &str, index: usize) -> SimResult<()> {
@@ -285,16 +227,21 @@ impl Simulator {
         if self.masters.my_sets[index].name == name {
             return Ok(());
         }
-        self.masters.my_sets[index].name = name.to_string();
-        self.save_my_set()
+        let mut my_sets = self.masters.my_sets.clone();
+        my_sets[index].name = name.to_string();
+        self.commit_my_sets(my_sets)
     }
 
-    fn save_my_set(&mut self) -> SimResult<()> {
-        self.file.save_my_set_csv(&self.masters.my_sets)?;
+    // Save succeeds before memory changes, so a failed save never leaves the
+    // app showing data the files do not have. The three files are still
+    // written in order, so a mid-failure can leave charm/artian flags stale,
+    // which the next save repairs.
+    fn commit_my_sets(&mut self, my_sets: Vec<EquipSet>) -> SimResult<()> {
+        self.file.save_my_set_csv(&my_sets)?;
         self.file
-            .save_additional_charm_csv(&self.masters.additional_charms, &self.masters.my_sets)?;
-        self.file
-            .save_artian_csv(&self.masters.artians, &self.masters.my_sets)?;
+            .save_additional_charm_csv(&self.masters.additional_charms, &my_sets)?;
+        self.file.save_artian_csv(&self.masters.artians, &my_sets)?;
+        self.masters.my_sets = my_sets;
         Ok(())
     }
 
@@ -302,28 +249,10 @@ impl Simulator {
         self.searcher.take()
     }
 
-    pub fn adopt_searcher(
-        &mut self,
-        searcher: Searcher,
-        all_searched: bool,
-        canceled: bool,
-    ) -> Vec<EquipSet> {
-        self.is_searched_all = all_searched;
-        self.is_canceling = canceled;
+    pub fn adopt_searcher(&mut self, searcher: Searcher) -> Vec<EquipSet> {
         let result = searcher.result_sets.clone();
         self.searcher = Some(searcher);
         result
-    }
-
-    pub fn set_searcher(
-        &mut self,
-        searcher: Searcher,
-        all_searched: bool,
-        skills: &[Skill],
-        canceled: bool,
-    ) -> SimResult<Vec<EquipSet>> {
-        self.update_recent_skill(skills)?;
-        Ok(self.adopt_searcher(searcher, all_searched, canceled))
     }
 
     pub fn current_condition(&self) -> Option<SearchCondition> {
@@ -345,22 +274,28 @@ impl Simulator {
                 new_names.push(old_name.clone());
             }
         }
+        self.file.save_recent_skill_csv(&new_names)?;
         self.masters.recent_skill_names = new_names;
-        self.file
-            .save_recent_skill_csv(&self.masters.recent_skill_names)
+        Ok(())
     }
 
     pub fn add_my_condition(&mut self, condition: SearchCondition) -> SimResult<()> {
-        self.masters.my_conditions.push(condition);
-        self.file.save_my_condition_csv(&self.masters.my_conditions)
+        let mut conditions = self.masters.my_conditions.clone();
+        conditions.push(condition);
+        self.file.save_my_condition_csv(&conditions)?;
+        self.masters.my_conditions = conditions;
+        Ok(())
     }
 
     pub fn delete_my_condition_at(&mut self, index: usize) -> SimResult<()> {
         if index >= self.masters.my_conditions.len() {
             return Ok(());
         }
-        self.masters.my_conditions.remove(index);
-        self.file.save_my_condition_csv(&self.masters.my_conditions)
+        let mut conditions = self.masters.my_conditions.clone();
+        conditions.remove(index);
+        self.file.save_my_condition_csv(&conditions)?;
+        self.masters.my_conditions = conditions;
+        Ok(())
     }
 
     pub fn change_name_of_my_condition(&mut self, name: &str, index: usize) -> SimResult<()> {
@@ -370,18 +305,38 @@ impl Simulator {
         if self.masters.my_conditions[index].disp_name.as_deref() == Some(name) {
             return Ok(());
         }
-        self.masters.my_conditions[index].disp_name = Some(name.to_string());
-        self.file.save_my_condition_csv(&self.masters.my_conditions)
+        let mut conditions = self.masters.my_conditions.clone();
+        conditions[index].disp_name = Some(name.to_string());
+        self.file.save_my_condition_csv(&conditions)?;
+        self.masters.my_conditions = conditions;
+        Ok(())
     }
 
     pub fn save_deco_count(&mut self, deco_name: &str, count: i32) -> SimResult<()> {
+        if count < 0 || !self.masters.decos.iter().any(|d| d.name == deco_name) {
+            return Ok(());
+        }
+        let mut decos = self.masters.decos.clone();
+        for deco in &mut decos {
+            if deco.name == deco_name {
+                deco.deco_count = count;
+            }
+        }
+        self.file.save_deco_count_json(&decos)?;
+        self.masters.decos = decos;
+        Ok(())
+    }
+
+    pub fn set_all_deco_count(&mut self, count: i32) -> SimResult<()> {
         if count < 0 {
             return Ok(());
         }
-        if let Some(deco) = self.masters.decos.iter_mut().find(|d| d.name == deco_name) {
+        let mut decos = self.masters.decos.clone();
+        for deco in &mut decos {
             deco.deco_count = count;
-            self.file.save_deco_count_json(&self.masters.decos)?;
         }
+        self.file.save_deco_count_json(&decos)?;
+        self.masters.decos = decos;
         Ok(())
     }
 
@@ -394,34 +349,92 @@ impl Simulator {
         {
             return Ok(());
         }
-        self.masters.additional_charms.push(charm);
-        self.calc_lower_charm()?;
+        if let Some(name) = duplicate_skill_name(&charm) {
+            return Err(SimError(format!("スキル {} が重複しています。", name)));
+        }
+        let mut charms = self.masters.additional_charms.clone();
+        if self.logic.use_calc_upper_charm {
+            let decos = &self.masters.decos;
+            // The added charm's own upper is searched against the old list, and
+            // each existing charm only needs a pair check against the addition,
+            // not a re-search over the whole list.
+            let added_upper = upper_info_for(decos, &charm, &charms, true)?;
+            let mut added = charm;
+            added.upper = added_upper;
+            for old in charms.iter_mut() {
+                if !is_left_upper(decos, &added, old, true)? {
+                    continue;
+                }
+                let mutual = is_left_upper(decos, old, &added, true)?;
+                let strict = !mutual;
+                let replace = match &old.upper {
+                    None => true,
+                    Some(_) => strict,
+                };
+                if replace {
+                    old.upper = Some(UpperInfo {
+                        name: added.name.clone(),
+                        disp_name: added.disp_name().to_string(),
+                        is_full_upper: strict,
+                    });
+                }
+            }
+            charms.push(added);
+        } else {
+            charms.push(charm);
+        }
         self.file
-            .save_additional_charm_csv(&self.masters.additional_charms, &self.masters.my_sets)
+            .save_additional_charm_csv(&charms, &self.masters.my_sets)?;
+        self.masters.additional_charms = charms;
+        Ok(())
     }
 
     pub fn delete_charm(&mut self, name: &str) -> SimResult<()> {
-        let index = match self
+        if !self
             .masters
             .additional_charms
             .iter()
-            .position(|c| c.name == name)
+            .any(|c| c.name == name)
         {
-            Some(index) => index,
-            None => return Ok(()),
-        };
-        self.delete_clude(name, true)?;
-        let before = self.masters.my_sets.len();
-        self.masters.my_sets.retain(|set| set.charm.name != name);
-        let removed_sets = self.masters.my_sets.len() != before;
-        self.masters.additional_charms.remove(index);
-        self.calc_lower_charm()?;
-        if removed_sets {
-            self.save_my_set()
-        } else {
-            self.file
-                .save_additional_charm_csv(&self.masters.additional_charms, &self.masters.my_sets)
+            return Ok(());
         }
+        let mut charms: Vec<Equipment> = self
+            .masters
+            .additional_charms
+            .iter()
+            .filter(|c| c.name != name)
+            .cloned()
+            .collect();
+        let my_sets: Vec<EquipSet> = self
+            .masters
+            .my_sets
+            .iter()
+            .filter(|set| set.charm.name != name)
+            .cloned()
+            .collect();
+        let removed_sets = my_sets.len() != self.masters.my_sets.len();
+        if self.logic.use_calc_upper_charm {
+            let decos = &self.masters.decos;
+            // Only charms that named the deleted one need a fresh upper search.
+            for index in 0..charms.len() {
+                if charms[index].upper.as_ref().map(|u| u.name.as_str()) != Some(name) {
+                    continue;
+                }
+                let (before, rest) = charms.split_at_mut(index);
+                let (charm, after) = rest.split_first_mut().unwrap();
+                let candidates: Vec<Equipment> =
+                    before.iter().chain(after.iter()).cloned().collect();
+                charm.upper = upper_info_for(decos, charm, &candidates, true)?;
+            }
+        }
+        self.file.save_additional_charm_csv(&charms, &my_sets)?;
+        if removed_sets {
+            self.file.save_my_set_csv(&my_sets)?;
+            self.file.save_artian_csv(&self.masters.artians, &my_sets)?;
+        }
+        self.masters.additional_charms = charms;
+        self.masters.my_sets = my_sets;
+        self.delete_clude(name, true)
     }
 
     pub fn move_charm(&mut self, drop_index: usize, target_index: usize) -> SimResult<()> {
@@ -429,37 +442,57 @@ impl Simulator {
         if drop_index >= count || target_index >= count || drop_index == target_index {
             return Ok(());
         }
-        let charm = self.masters.additional_charms.remove(drop_index);
-        self.masters.additional_charms.insert(target_index, charm);
+        let mut charms = self.masters.additional_charms.clone();
+        let charm = charms.remove(drop_index);
+        charms.insert(target_index, charm);
         self.file
-            .save_additional_charm_csv(&self.masters.additional_charms, &self.masters.my_sets)
+            .save_additional_charm_csv(&charms, &self.masters.my_sets)?;
+        self.masters.additional_charms = charms;
+        Ok(())
     }
 
     pub fn add_artian(&mut self, artian: Equipment) -> SimResult<()> {
         if self.masters.artians.iter().any(|a| a.name == artian.name) {
             return Ok(());
         }
-        self.masters.artians.push(artian);
-        self.file
-            .save_artian_csv(&self.masters.artians, &self.masters.my_sets)
+        if let Some(name) = duplicate_skill_name(&artian) {
+            return Err(SimError(format!("スキル {} が重複しています。", name)));
+        }
+        let mut artians = self.masters.artians.clone();
+        artians.push(artian);
+        self.file.save_artian_csv(&artians, &self.masters.my_sets)?;
+        self.masters.artians = artians;
+        Ok(())
     }
 
     pub fn delete_artian(&mut self, name: &str) -> SimResult<()> {
-        let index = match self.masters.artians.iter().position(|a| a.name == name) {
-            Some(index) => index,
-            None => return Ok(()),
-        };
-        self.delete_clude(name, true)?;
-        let before = self.masters.my_sets.len();
-        self.masters.my_sets.retain(|set| set.weapon.name != name);
-        let removed_sets = self.masters.my_sets.len() != before;
-        self.masters.artians.remove(index);
-        if removed_sets {
-            self.save_my_set()
-        } else {
-            self.file
-                .save_artian_csv(&self.masters.artians, &self.masters.my_sets)
+        if !self.masters.artians.iter().any(|a| a.name == name) {
+            return Ok(());
         }
+        let artians: Vec<Equipment> = self
+            .masters
+            .artians
+            .iter()
+            .filter(|a| a.name != name)
+            .cloned()
+            .collect();
+        let my_sets: Vec<EquipSet> = self
+            .masters
+            .my_sets
+            .iter()
+            .filter(|set| set.weapon.name != name)
+            .cloned()
+            .collect();
+        let removed_sets = my_sets.len() != self.masters.my_sets.len();
+        self.file.save_artian_csv(&artians, &my_sets)?;
+        if removed_sets {
+            self.file.save_my_set_csv(&my_sets)?;
+            self.file
+                .save_additional_charm_csv(&self.masters.additional_charms, &my_sets)?;
+        }
+        self.masters.artians = artians;
+        self.masters.my_sets = my_sets;
+        self.delete_clude(name, true)
     }
 
     pub fn move_artian(&mut self, drop_index: usize, target_index: usize) -> SimResult<()> {
@@ -467,47 +500,39 @@ impl Simulator {
         if drop_index >= count || target_index >= count || drop_index == target_index {
             return Ok(());
         }
-        let artian = self.masters.artians.remove(drop_index);
-        self.masters.artians.insert(target_index, artian);
-        self.file
-            .save_artian_csv(&self.masters.artians, &self.masters.my_sets)
-    }
-
-    fn calc_lower_charm(&mut self) -> SimResult<()> {
-        calc_lower_charm_impl(&mut self.masters, &self.logic)
+        let mut artians = self.masters.artians.clone();
+        let artian = artians.remove(drop_index);
+        artians.insert(target_index, artian);
+        self.file.save_artian_csv(&artians, &self.masters.my_sets)?;
+        self.masters.artians = artians;
+        Ok(())
     }
 }
 
-fn calc_lower_charm_impl(masters: &mut Masters, logic: &LogicConfig) -> SimResult<()> {
+fn duplicate_skill_name(equip: &Equipment) -> Option<&str> {
+    let mut seen = HashSet::new();
+    equip
+        .skills
+        .iter()
+        .find(|skill| !seen.insert(skill.name.as_str()))
+        .map(|skill| skill.name.as_str())
+}
+
+fn calc_charm_uppers(
+    decos: &[Equipment],
+    charms: &[Equipment],
+    logic: &LogicConfig,
+) -> SimResult<Vec<Option<UpperInfo>>> {
     if !logic.use_calc_upper_charm {
-        return Ok(());
+        return Ok(vec![None; charms.len()]);
     }
-    for charm in &mut masters.additional_charms {
-        charm.upper = None;
-    }
-    let snapshot = masters.additional_charms.clone();
     let compute = || {
-        snapshot
+        charms
             .par_iter()
-            .map(|charm| -> SimResult<Option<UpperInfo>> {
-                let upper = match has_upper_charm(masters, charm, true)? {
-                    Some(upper) => upper,
-                    None => return Ok(None),
-                };
-                let is_upper = is_left_upper(masters, charm, &upper, true)?;
-                Ok(Some(UpperInfo {
-                    name: upper.name.clone(),
-                    disp_name: upper.disp_name().to_string(),
-                    is_full_upper: !is_upper,
-                }))
-            })
+            .map(|charm| upper_info_for(decos, charm, charms, true))
             .collect::<SimResult<Vec<Option<UpperInfo>>>>()
     };
-    let uppers = run_parallel(logic, compute)?;
-    for (charm, upper) in masters.additional_charms.iter_mut().zip(uppers) {
-        charm.upper = upper;
-    }
-    Ok(())
+    run_parallel(logic, compute)
 }
 
 fn run_parallel<T: Send>(
@@ -628,11 +653,10 @@ fn load_masters(file: &FileOperation, logic: &LogicConfig) -> SimResult<Masters>
         }
     }
 
-    file.save_additional_charm_csv(&masters.additional_charms, &masters.my_sets)?;
-    file.save_artian_csv(&masters.artians, &masters.my_sets)?;
-
-    let mut masters = masters;
-    calc_lower_charm_impl(&mut masters, logic)?;
+    let uppers = calc_charm_uppers(&masters.decos, &masters.additional_charms, logic)?;
+    for (charm, upper) in masters.additional_charms.iter_mut().zip(uppers) {
+        charm.upper = upper;
+    }
     Ok(masters)
 }
 
@@ -654,11 +678,26 @@ pub fn search_extra_skill_impl(
                     return Ok(result);
                 }
                 for level in 1..=skill.level {
+                    // Levels that never activate (e.g. the gaps in a group or
+                    // series skill) cannot be applied; solving for them is
+                    // wasted work.
+                    if skill.is_hide_level(Some(level)) {
+                        continue;
+                    }
                     let mut ex_condition = condition.copy_for_search();
                     let ex_skill = masters.make_skill(&skill.name, level);
                     let is_new_skill = ex_condition.add_skill(&ex_skill);
                     if is_new_skill {
-                        let mut searcher = Searcher::new(ex_condition, range.clone())?;
+                        // Virtual charms/artians must be rebuilt per iteration:
+                        // they are generated from the skills under test.
+                        let range = if ex_condition.is_best_charm_search
+                            || ex_condition.is_best_artian_search
+                        {
+                            build_search_range(&ex_condition, masters)
+                        } else {
+                            range.clone()
+                        };
+                        let mut searcher = Searcher::new(ex_condition, range)?;
                         searcher.exec_search(1, None)?;
                         if searcher.result_sets.is_empty() {
                             break;
@@ -698,17 +737,17 @@ pub fn search_charm_impl(
 ) -> SimResult<Vec<EquipSet>> {
     let target_charms =
         condition.make_related_charms(&masters.shining_charm_combos, &masters.shining_charm_groups);
-    let run = || {
-        target_charms
+    let base_range = build_search_range(condition, masters);
+    let compute = || -> SimResult<Vec<EquipSet>> {
+        let candidates: Vec<Option<EquipSet>> = target_charms
             .par_iter()
             .map(|target_charm| -> SimResult<Option<EquipSet>> {
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
                 let ex_condition = condition.copy_for_search();
-                let mut range = build_search_range(&ex_condition, masters);
+                let mut range = base_range.clone();
                 range.charms = vec![target_charm.clone()];
-                range.cludes = masters.cludes.clone();
                 let mut ex_searcher = Searcher::new(ex_condition, range)?;
                 ex_searcher.exec_search(1, None)?;
                 if let Some(progress) = progress {
@@ -716,25 +755,39 @@ pub fn search_charm_impl(
                 }
                 Ok(ex_searcher.result_sets.first().cloned())
             })
+            .collect::<SimResult<Vec<Option<EquipSet>>>>()?;
+        let result_sets: Vec<EquipSet> = candidates.into_iter().flatten().collect();
+        if result_sets.len() < 2 {
+            return Ok(result_sets);
+        }
+        let decos = &masters.decos;
+        result_sets
+            .par_iter()
+            .enumerate()
+            .map(|(left_index, left)| -> SimResult<Option<EquipSet>> {
+                // On cancel every entry is kept, returning the unfiltered list.
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(Some(left.clone()));
+                }
+                for (right_index, right) in result_sets.iter().enumerate() {
+                    if left_index == right_index {
+                        continue;
+                    }
+                    if is_left_upper(decos, &left.charm, &right.charm, false)? {
+                        // Equivalent charms satisfy each other both ways; the
+                        // earlier candidate wins so they do not remove each
+                        // other.
+                        if left_index > right_index
+                            || !is_left_upper(decos, &right.charm, &left.charm, false)?
+                        {
+                            return Ok(None);
+                        }
+                    }
+                }
+                Ok(Some(left.clone()))
+            })
             .collect::<SimResult<Vec<Option<EquipSet>>>>()
+            .map(|filtered| filtered.into_iter().flatten().collect())
     };
-    let results = run_parallel(logic, run)?;
-    let result_sets: Vec<EquipSet> = results.into_iter().flatten().collect();
-    let mut filtered = Vec::new();
-    for (left_index, left) in result_sets.iter().enumerate() {
-        let mut has_lower = false;
-        for (right_index, right) in result_sets.iter().enumerate() {
-            if left_index == right_index {
-                continue;
-            }
-            if is_left_upper(masters, &left.charm, &right.charm, false)? {
-                has_lower = true;
-                break;
-            }
-        }
-        if !has_lower {
-            filtered.push(left.clone());
-        }
-    }
-    Ok(filtered)
+    run_parallel(logic, compute)
 }

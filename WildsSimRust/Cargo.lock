@@ -4024,10 +4024,8 @@ name = "wildssim"
 version = "0.1.0"
 dependencies = [
  "eframe",
- "egui",
  "rfd",
  "simmodel",
- "uuid",
 ]
 
 [[package]]
