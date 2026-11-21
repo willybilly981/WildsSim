@@ -1,4 +1,4 @@
-name: Release (Rust port)
+name: Release (Rust)
 
 on:
   workflow_dispatch:
@@ -12,9 +12,6 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: WildsSimRust
 
     steps:
       - name: Checkout
@@ -38,5 +35,5 @@ jobs:
           prerelease: true
           make_latest: false
           name: ${{ github.ref_name }}
-          body: Unofficial, experimental AI-assisted Rust port. See WildsSimRust/README.md.
-          files: WildsSimRust/WildsSimRust-${{ github.ref_name }}.zip
+          body: Unofficial, experimental AI-assisted Rust port. See README.md.
+          files: WildsSimRust-${{ github.ref_name }}.zip
