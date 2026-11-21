@@ -55,3 +55,12 @@ cargo test --workspace --all-targets
 ## ライセンス
 
 MIT License。原本の著作権表示を `LICENSE` に残しています。
+
+## 謝辞
+
+原本の [WildsSim](https://github.com/EXXXI/WildsSim) に感謝します。
+原本の README に記載されているスペシャルサンクスの皆様にも感謝します。
+
+## お問い合わせ
+
+issue や PR への対応はしません。改造したい方はご自身でどうぞ。
